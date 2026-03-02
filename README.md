@@ -44,6 +44,15 @@ You need:
 * `ld`
 * `qemu-system-x86\_64`
 * `make`
+---
+## Alternatively
+
+You could run:
+
+* `chmod +x build.sh`
+* `chmod +x install.sh`
+* `./build.sh`
+* `./install.sh`
 
 ---
 

@@ -24,3 +24,6 @@ isodir/
 # OS-generated files
 .DS_Store
 Thumbs.db
+
+# My GitHub file
+update.sh

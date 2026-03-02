@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "fs.hpp"
+#include "memory/heap.hpp"
 #include "drivers/idt.hpp"
 #include "drivers/pic.hpp"
 #include "drivers/keyboard.hpp"
@@ -287,7 +288,7 @@ void handle_enter()
     putchar('\n');
 
     if (strcmp_simple(input_buffer, "ver"))
-        print("DOSnyx Version 2.2\n\n");
+        print("DOSnyx Version 2.3\n\n");
 
     else if (strcmp_simple(input_buffer, "about"))
         print("Experimental Hobby OS\n\n");
@@ -409,7 +410,19 @@ void handle_enter()
 
 extern "C" void kernel_main()
 {
-    idt_init();
+    heap_init();
+    char* test = (char*)kmalloc(64);
+
+if (test)
+{
+    print("Heap working!\n");
+}
+else
+{
+    print("Heap failed!\n");
+}
+asm volatile("hlt");   
+idt_init();
     pic_remap();
     void pic_clear_mask(uint8_t irq);
     pic_clear_mask(1);
