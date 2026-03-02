@@ -411,7 +411,7 @@ void handle_enter()
 extern "C" void kernel_main()
 {
     heap_init();
-    char* test = (char*)kmalloc(64);
+    /*char* test = (char*)kmalloc(64);
 
 if (test)
 {
@@ -421,7 +421,7 @@ else
 {
     print("Heap failed!\n");
 }
-asm volatile("hlt");   
+asm volatile("hlt");  */ 
 idt_init();
     pic_remap();
     void pic_clear_mask(uint8_t irq);
