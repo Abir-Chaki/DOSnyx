@@ -5,6 +5,7 @@
 extern "C" {
     void putchar(char c);
     void print(const char* str);
+    void clear_screen();
 }
 
 extern int col;
@@ -14,45 +15,29 @@ extern volatile uint16_t* vga;
 
 static const int VGA_WIDTH = 80;
 
-/* ================= INTERNAL HELPERS ================= */
-
-/*int fs_find_local(const char* name)
-{
-    for (int i = 0; i < MAX_NODES; i++)
-        if (nodes[i].used &&
-            nodes[i].parent == current_dir &&
-            strcmp_simple(nodes[i].name, name))
-            return i;
-    return -1;
-}*/
-
 /* ================= NOTEPAD ================= */
 
-void notepad(const char* filename)
+void notepad(Node* file_node)
 {
-    int file_idx = fs_find(filename);
+    // Safety check: if the pointer is null, get out immediately
+    if (!file_node) return;
 
-    // If file does not exist → create
-    if (file_idx < 0)
-        file_idx = fs_create(filename, false);
+    print("\n--- DOSnyx Notepad v2.6 ---\n");
+    print("Editing: ");
+    print(file_node->name);
+    print("\n[ESC]: Save & Exit | [BACKSPACE]: Delete\n");
+    print("------------------------------------------\n\n");
 
-    print("\n--- DOSnyx Notepad ---\n");
-    print("File: ");
-    print(filename);
-    print("\nESC to save & exit\n\n");
+    // We use the Node's existing size to track where we are in the buffer
+    int len = file_node->size;
 
-    char buffer[1024];
-    int len = 0;
-
-    // LOAD EXISTING CONTENT
-    if (nodes[file_idx].size > 0)
+    // LOAD EXISTING CONTENT FROM THE NODE
+    if (len > 0)
     {
-        for (int i = 0; i < nodes[file_idx].size; i++)
+        for (int i = 0; i < len; i++)
         {
-            buffer[i] = nodes[file_idx].content[i];
-            putchar(buffer[i]);
+            putchar(file_node->content[i]);
         }
-        len = nodes[file_idx].size;
     }
 
     while (true)
@@ -60,15 +45,14 @@ void notepad(const char* filename)
         char c = keyboard_getchar();
         if (!c) continue;
 
-        // ESC → SAVE & EXIT
+        // ESC (ASCII 27) -> SAVE & EXIT
         if (c == 27)
         {
-            for (int i = 0; i < len; i++)
-                nodes[file_idx].content[i] = buffer[i];
-
-            nodes[file_idx].size = len;
-
-            print("\n\nSaved.\n");
+            file_node->size = len;
+            // Ensure the content is null-terminated for safety
+            if (len < 1023) file_node->content[len] = '\0'; 
+            
+            print("\n\nChanges saved to heap node.\n");
             return;
         }
 
@@ -78,22 +62,26 @@ void notepad(const char* filename)
             if (len > 0)
             {
                 len--;
-                if (col > 0)
+                if (col > 0) {
                     col--;
-
+                } else if (row > 0) {
+                    // Simple wrap-back logic if needed
+                    row--;
+                    col = VGA_WIDTH - 1;
+                }
                 vga[row * VGA_WIDTH + col] = (color << 8) | ' ';
             }
             continue;
         }
 
-        // TAB → 4 spaces
+        // TAB -> 4 spaces
         if (c == '\t')
         {
             for (int i = 0; i < 4; i++)
             {
-                if (len < 1023)
+                if (len < 1023) // Still respecting the Node's content array limit
                 {
-                    buffer[len++] = ' ';
+                    file_node->content[len++] = ' ';
                     putchar(' ');
                 }
             }
@@ -101,9 +89,11 @@ void notepad(const char* filename)
         }
 
         // NORMAL CHARACTER
+        // Note: Currently limited to 1024 bytes per Node definition.
+        // In v2.7, we can implement realloc() to make this infinite!
         if (len < 1023)
         {
-            buffer[len++] = c;
+            file_node->content[len++] = c;
             putchar(c);
         }
     }

@@ -6,65 +6,97 @@
 #include "drivers/pic.hpp"
 #include "drivers/keyboard.hpp"
 
-// Updated to include CPU-pushed registers for better Panic reporting
-
-struct interrupt_frame
-{
-    uint64_t r11, r10, r9, r8;
-    uint64_t rdi, rsi, rbp, rbx;
-    uint64_t rdx, rcx, rax;
-    uint64_t int_no;
-    uint64_t err_code;
-    uint64_t rip;
-    uint64_t cs;
-    uint64_t rflags;
-    uint64_t rsp;
-    uint64_t ss;
+struct interrupt_frame {
+    uint64_t r11, r10, r9, r8, rdi, rsi, rbp, rbx, rdx, rcx, rax;
+    uint64_t int_no, err_code, rip, cs, rflags, rsp, ss;
 };
 
-extern void notepad(const char* filename);
+// Externs for Notepad and Kernel Entry
+extern void notepad(Node* file_node);
 extern "C" void kernel_main();
 
-/* ================= VGA ================= */
-
+/* ================= VGA & UI GLOBALS ================= */
 static const int VGA_WIDTH  = 80;
 static const int VGA_HEIGHT = 25;
-
 volatile uint16_t* vga = (uint16_t*)0xB8000;
-volatile uint64_t timer_ticks = 0;
+extern "C" volatile uint64_t timer_ticks = 0;
 
 uint8_t color = 0x0F;
 int row = 0;
 int col = 0;
-
-bool shift_pressed = false;
 char input_buffer[256];
 int input_length = 0;
 int prompt_start_col = 0;
-
 char username[32] = "nyx authority/dos";
 
-/* ================= FILE SYSTEM ================= */
+/* ================= FILE SYSTEM GLOBALS ================= */
+Node* all_nodes_head = nullptr; 
+Node* current_dir_ptr = nullptr;
 
-Node nodes[MAX_NODES];
-int current_dir = 0;
+/* ================= UTILITY FUNCTIONS ================= */
 
-/* ================= PORT I/O ================= */
+void kstrncpy(char* dest, const char* src, int n) {
+    int i;
+    for (i = 0; i < n && src[i] != '\0'; i++) dest[i] = src[i];
+    dest[i] = '\0';
+}
 
-static inline uint8_t inb(uint16_t port)
-{
+bool strcmp_simple(const char* a, const char* b) {
+    while (*a && *b) {
+        if (*a != *b) return false;
+        a++; b++;
+    }
+    return (*a == 0 && *b == 0);
+}
+
+static inline uint8_t inb(uint16_t port) {
     uint8_t ret;
     asm volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
 
-static inline void outb(uint16_t port, uint8_t value)
-{
+static inline void outb(uint16_t port, uint8_t value) {
     asm volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
 }
+static inline void outw(uint16_t port, uint16_t value) {
+    asm volatile ("outw %0, %1" : : "a"(value), "Nd"(port));
+}
 
-/* ================= CURSOR ================= */
+void update_cursor() {
+    uint16_t pos = row * VGA_WIDTH + col;
+    outb(0x3D4, 0x0F); outb(0x3D5, (uint8_t)(pos & 0xFF));
+    outb(0x3D4, 0x0E); outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
+}
 
+void scroll() {
+    for (int i = 0; i < (VGA_HEIGHT - 1) * VGA_WIDTH; i++) vga[i] = vga[i + VGA_WIDTH];
+    for (int i = (VGA_HEIGHT - 1) * VGA_WIDTH; i < VGA_HEIGHT * VGA_WIDTH; i++) 
+        vga[i] = (color << 8) | ' ';
+    row = VGA_HEIGHT - 1;
+}
+
+void clear_screen() {
+    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) vga[i] = (color << 8) | ' ';
+    row = 0; col = 0;
+    update_cursor();
+}
+
+extern "C" void putchar(char c) {
+    if (c == '\n') { row++; col = 0; } 
+    else {
+        vga[row * VGA_WIDTH + col] = (color << 8) | c;
+        col++;
+        if (col >= VGA_WIDTH) { col = 0; row++; }
+    }
+    if (row >= VGA_HEIGHT) scroll();
+    update_cursor();
+}
+
+extern "C" void print(const char* str) {
+    while (*str) putchar(*str++);
+}
+
+/* ================= FROM BACKUP: CURSOR ================= */
 void enable_cursor(uint8_t start, uint8_t end)
 {
     outb(0x3D4, 0x0A);
@@ -73,426 +105,268 @@ void enable_cursor(uint8_t start, uint8_t end)
     outb(0x3D5, (inb(0x3D5) & 0xE0) | end);
 }
 
-void update_cursor()
-{
-    uint16_t pos = row * VGA_WIDTH + col;
-    outb(0x3D4, 0x0F);
-    outb(0x3D5, (uint8_t)(pos & 0xFF));
-    outb(0x3D4, 0x0E);
-    outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
-}
-
-/* ================= SCREEN ================= */
-
-void scroll()
-{
-    for (int i = 0; i < (VGA_HEIGHT - 1) * VGA_WIDTH; i++)
-        vga[i] = vga[i + VGA_WIDTH];
-
-    for (int i = (VGA_HEIGHT - 1) * VGA_WIDTH; i < VGA_HEIGHT * VGA_WIDTH; i++)
-        vga[i] = (color << 8) | ' ';
-
-    row = VGA_HEIGHT - 1;
-}
-
-void clear_screen()
-{
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++)
-        vga[i] = (color << 8) | ' ';
-
-    row = 0;
-    col = 0;
-    update_cursor();
-}
-
-extern "C" void putchar(char c)
-{
-    if (c == '\n') {
-        row++;
-        col = 0;
-    } else {
-        vga[row * VGA_WIDTH + col] = (color << 8) | c;
-        col++;
-        if (col >= VGA_WIDTH) {
-            col = 0;
-            row++;
-        }
-    }
-
-    if (row >= VGA_HEIGHT)
-        scroll();
-
-    update_cursor();
-}
-
-void hard_reboot()
-{
-    uint8_t good = 0x02;
-    while (good & 0x02)
-        good = inb(0x64);
-    outb(0x64, 0xFE);
-    while (true) { asm volatile ("hlt"); }
-}
-
-extern "C" void print(const char* str)
-{
-    while (*str)
-        putchar(*str++);
-}
-
-
-/* ================= HELPERS ================= */
-
-bool strcmp_simple(const char* a, const char* b)
-{
-    while (*a && *b) {
-        if (*a != *b) return false;
-        a++; b++;
-    }
-    return (*a == 0 && *b == 0);
-}
-
-void print_hex(uint64_t val)
-{
-    const char* hex = "0123456789ABCDEF";
-    print("0x");
-    for (int i = 60; i >= 0; i -= 4)
-        putchar(hex[(val >> i) & 0xF]);
-}
-
-class Vector3 {
-public:
-    int x, y, z;
-    Vector3(int _x, int _y, int _z) : x(_x), y(_y), z(_z) {
-        // This confirms constructors are called
-    }
-};
-
-void test_new_operator() {
-    print("Testing C++ new... ");
-    
-    Vector3* v = new Vector3(10, 20, 30);
-
-    if (v->x == 10 && v->z == 30) {
-        print("SUCCESS! Value: ");
-        print_hex(v->y); // Should show 0x14 (20)
-        putchar('\n');
-    } else {
-        print("FAILED!\n");
-    }
-
-    delete v; // This calls your (currently empty) kfree
-    asm volatile("hlt");
-}
-
-/* ================= SPLASH ================= */
-
+/* ================= FROM BACKUP: SPLASH ================= */
 void splash_screen()
 {
-    color = 0x1F;
+    color = 0x1F; // Blue background, White text
     clear_screen();
     print("DOSnyx Operating System\n");
-    print("Version 2.5\n\n");
+    print("Version 2.6\n\n");
     print("Press any key to continue...");
-    while (!keyboard_getchar());
-    color = 0x0F;
+    
+    // This waits for a hardware interrupt from the keyboard
+    while (!keyboard_getchar()); 
+    
+    color = 0x0F; // Back to Black background, White text
     clear_screen();
 }
 
-/* ================= FILE SYSTEM ================= */
-
-void fs_init()
-{
-    for (int i = 0; i < MAX_NODES; i++)
-        nodes[i].used = false;
-
-    nodes[0].used = true;
-    nodes[0].is_folder = true;
-    nodes[0].parent = -1;
-    nodes[0].name[0] = 0;
+void print_hex(uint64_t val) {
+    const char* hex = "0123456789ABCDEF";
+    print("0x");
+    for (int i = 60; i >= 0; i -= 4) putchar(hex[(val >> i) & 0xF]);
 }
 
-int fs_find(const char* name)
-{
-    for (int i = 0; i < MAX_NODES; i++)
-        if (nodes[i].used &&
-            nodes[i].parent == current_dir &&
-            strcmp_simple(nodes[i].name, name))
-            return i;
-    return -1;
+void hard_reboot() {
+    uint8_t good = 0x02;
+    while (good & 0x02) good = inb(0x64);
+    outb(0x64, 0xFE);
+    while (true) asm volatile ("hlt");
 }
 
-int fs_create(const char* name, bool folder)
-{
-    for (int i = 0; i < MAX_NODES; i++)
-        if (!nodes[i].used)
-        {
-            nodes[i].used = true;
-            nodes[i].is_folder = folder;
-            nodes[i].parent = current_dir;
-            int j = 0;
-            while (name[j] && j < 15) {
-                nodes[i].name[j] = name[j];
-                j++;
-            }
-            nodes[i].name[j] = 0;
-            nodes[i].size = 0;
-            return i;
+/* ================= DYNAMIC FS CORE ================= */
+
+void fs_init() {
+    print("Allocating Root... ");
+    //asm volatile("hlt");
+    Node* root = new Node();
+    //asm volatile("hlt");
+    
+    if (root == nullptr) {
+        color = 0x1F; // Blue
+        print("CRITICAL: Heap returned NULL for Root Node!\n");
+        while(1) asm("hlt");
+    }
+    //asm volatile("hlt");
+
+    // Print the address to see where the heap is putting things
+    print("Address: ");
+    print_hex((uint64_t)root);
+    putchar('\n');
+    //asm volatile("hlt");
+
+    kstrncpy(root->name, "root", 15);
+    root->is_folder = true;
+    root->parent = nullptr;
+    root->next = nullptr;
+    root->size = 0;
+    
+    all_nodes_head = root;
+    current_dir_ptr = root;
+}
+
+Node* fs_find(const char* name) {
+    Node* curr = all_nodes_head;
+    while (curr != nullptr) {
+        if (curr->parent == current_dir_ptr && strcmp_simple(curr->name, name))
+            return curr;
+        curr = curr->next;
+    }
+    return nullptr;
+}
+
+Node* fs_create(const char* name, bool folder) {
+    Node* newNode = new Node();
+    kstrncpy(newNode->name, name, 15);
+    newNode->is_folder = folder;
+    newNode->parent = current_dir_ptr;
+    newNode->size = 0;
+    newNode->content[0] = 0; // Initialize first byte
+    
+    newNode->next = all_nodes_head;
+    all_nodes_head = newNode;
+    return newNode;
+}
+
+void fs_delete(const char* name) {
+    Node* curr = all_nodes_head;
+    Node* prev = nullptr;
+    while (curr != nullptr) {
+        if (curr->parent == current_dir_ptr && strcmp_simple(curr->name, name)) {
+            if (prev == nullptr) all_nodes_head = curr->next;
+            else prev->next = curr->next;
+            delete curr;
+            return;
         }
-    return -1;
-}
-
-void fs_delete(const char* name)
-{
-    int idx = fs_find(name);
-    if (idx >= 0)
-        nodes[idx].used = false;
-}
-
-/* ================= PROMPT ================= */
-
-void print_path(int dir)
-{
-    if (dir == -1) return;
-    print_path(nodes[dir].parent);
-    if (dir != 0) {
-        print(nodes[dir].name);
-        print("/");
+        prev = curr;
+        curr = curr->next;
     }
 }
 
-void print_prompt()
-{
+/* ================= SHELL UI ================= */
+
+void print_path(Node* dir) {
+    if (dir == nullptr || dir->parent == nullptr) return; 
+    print_path(dir->parent);
+    print(dir->name);
+    print("/");
+}
+
+void print_prompt() {
     if (col != 0) putchar('\n');
     print("1:/");
-    print_path(current_dir);
+    print_path(current_dir_ptr);
     print("> ");
     prompt_start_col = col;
     input_length = 0;
 }
 
-/* ================= COMMAND HANDLING ================= */
-
-void show_cmds()
-{
-    print("ver - Current Version\n");
-    print("about - About DOSnyx\n");
-    print("cl - Clear Console\n");
-    print("rst - Reboot\n");
-    print("dir - List files\n");
-    print("create <file> - Create a file\n");
-    print("del <name> - Delete a file/folder\n");
-    print("mf <folder> - Make folder\n");
-    print("cf <folder> - Change folder\n");
-    print("prnline <text> - Output text\n");
-    print("usrnm - Current Username\n");
-    print("write <file> - Open Notepad\n");
-    print("cmds - Help menu\n\n");
+void show_cmds() {
+    print("ver - Version Info\nabout - About DOSnyx\ncl - Clear screen\nrst - Reboot\n");
+    print("dir - List files\ncreate <f> - New file\ndel <f> - Delete\nmf <f> - New folder\n");
+    print("cf <f> - Change folder\nusrnm - Current user\nwrite <f> - Notepad\n\n");
 }
 
-void handle_enter()
-{
+void handle_enter() {
     input_buffer[input_length] = 0;
     putchar('\n');
 
-    // ver
-    if (strcmp_simple(input_buffer, "ver"))
-        print("DOSnyx Version 2.5\n\n");
-
-    // about
-    else if (strcmp_simple(input_buffer, "about"))
-        print("DOSnyx: Experimental Hybrid Kernel Concept\n\n");
-
-    // cl
-    else if (strcmp_simple(input_buffer, "cl")) {
-        clear_screen();
-        print_prompt();
-        return;
+    if (strcmp_simple(input_buffer, "ver")) {
+        print("DOSnyx Version 2.6\n\n");
     }
-
-    // rst
-    else if (strcmp_simple(input_buffer, "rst"))
+    else if (strcmp_simple(input_buffer, "about")) {
+        print("DOSnyx: Hybrid Kernel Concept\nBy Abir Chaki | 13 y/o Dev | India\n\n");
+    }
+    else if (strcmp_simple(input_buffer, "cl")) {
+        clear_screen(); print_prompt(); return;
+    }
+    else if (strcmp_simple(input_buffer, "rst")) {
         hard_reboot();
-
-    // dir
+    }
+    else if (strcmp_simple(input_buffer, "usrnm")) {
+        print(username); print("\n\n");
+    }
+    else if (strcmp_simple(input_buffer, "cmds")) {
+        show_cmds();
+    }
     else if (strcmp_simple(input_buffer, "dir")) {
-        for (int i = 0; i < MAX_NODES; i++)
-            if (nodes[i].used && nodes[i].parent == current_dir) {
-                print(nodes[i].is_folder ? "[DIR] " : "[FILE] ");
-                print(nodes[i].name);
-                putchar('\n');
+        Node* curr = all_nodes_head;
+        while (curr != nullptr) {
+            if (curr->parent == current_dir_ptr) {
+                print(curr->is_folder ? "[DIR]  " : "[FILE] ");
+                print(curr->name); putchar('\n');
             }
+            curr = curr->next;
+        }
         putchar('\n');
     }
-
-    // usrnm
-    else if (strcmp_simple(input_buffer, "usrnm")) {
-        print(username);
-        print("\n\n");
-    }
-
-    // cmds
-    else if (strcmp_simple(input_buffer, "cmds"))
-        show_cmds();
-
-    // create <file>
-    else if (input_length > 7 && input_buffer[0]=='c' && input_buffer[1]=='r' && input_buffer[2]=='e') {
+    else if (input_length > 7 && input_buffer[0]=='c' && input_buffer[1]=='r') {
         fs_create(&input_buffer[7], false);
-        print("File created\n\n");
+        print("File created.\n\n");
     }
-
-    // del <name>
-    else if (input_length > 4 && input_buffer[0]=='d' && input_buffer[1]=='e' && input_buffer[2]=='l') {
+    else if (input_length > 4 && input_buffer[0]=='d' && input_buffer[1]=='e') {
         fs_delete(&input_buffer[4]);
-        print("Deleted\n\n");
+        print("Deleted.\n\n");
     }
-
-    // mf <folder>
-    else if (input_length > 3 && input_buffer[0]=='m' && input_buffer[1]=='f' && input_buffer[2]==' ') {
+    else if (input_length > 3 && input_buffer[0]=='m' && input_buffer[1]=='f') {
         fs_create(&input_buffer[3], true);
-        print("Folder created\n\n");
+        print("Folder created.\n\n");
     }
-
-    // cf <folder>
-    else if (input_length > 3 && input_buffer[0]=='c' && input_buffer[1]=='f' && input_buffer[2]==' ') {
+    else if (input_length > 3 && input_buffer[0]=='c' && input_buffer[1]=='f') {
         if (input_buffer[3]=='.' && input_buffer[4]=='.') {
-            if (nodes[current_dir].parent != -1)
-                current_dir = nodes[current_dir].parent;
+            if (current_dir_ptr->parent != nullptr) current_dir_ptr = current_dir_ptr->parent;
         } else {
-            int idx = fs_find(&input_buffer[3]);
-            if (idx >= 0 && nodes[idx].is_folder)
-                current_dir = idx;
-            else
-                print("Folder not found\n\n");
+            Node* target = fs_find(&input_buffer[3]);
+            if (target && target->is_folder) current_dir_ptr = target;
+            else print("Folder not found.\n\n");
         }
     }
-
-    // prnline <text>
     else if (input_length > 8 && input_buffer[0]=='p' && input_buffer[1]=='r' && input_buffer[2]=='n') {
-        print(&input_buffer[8]);
-        print("\n\n");
+        print(&input_buffer[8]); print("\n\n");
     }
-
-    // write <file>
-    else if (input_length > 6 && input_buffer[0]=='w' && input_buffer[1]=='r' && input_buffer[2]=='i') {
+    else if (input_length > 6 && input_buffer[0]=='w' && input_buffer[1]=='r') {
+        Node* target = fs_find(&input_buffer[6]);
+        if (!target) target = fs_create(&input_buffer[6], false);
         clear_screen();
-        notepad(&input_buffer[6]);
+        notepad(target);
     }
+    else if (strcmp_simple(input_buffer, "sht")) {
+        clear_screen();
+        color = 0x0E; // Yellow
+        print("Shutting down\n");
 
-    else if (input_length > 0)
-        print("Unknown command\n\n");
+        // Simple busy-wait (doesn't need the timer/interrupts)
+        // Adjust the number of zeros to change the delay time
+        for(volatile uint64_t i = 0; i < 900000000; i++) {
+            asm volatile("nop"); 
+        }
+
+//        // QEMU/Bochs Shutdown signals
+        outw(0xB004, 0x2000);
+        outw(0x604, 0x2000);
+        outw(0x4004, 0x3400);
+
+//       // If we reach here, hardware shutdown failed
+        color = 0x1F; 
+        print("\nIt is now safe to turn off the computer.\n");
+        while(1) asm("hlt");
+    }
+    else if (input_length > 0) print("Unknown command\n\n");
 
     print_prompt();
 }
 
-/* ================= KERNEL MAIN ================= */
+/* ================= KERNEL START ================= */
 
-extern "C" void kernel_main()
-{
-    // Initialize Memory Manager
-    uint64_t mem_size = 128 * 1024 * 1024;
-    uint64_t bitmap_loc = 0x180000; 
-    pmm_init(mem_size, bitmap_loc);
-
-    for (uint64_t addr = 0x200000; addr < mem_size; addr += 4096) {
-        pmm_mark_free(addr);
-    }
-    /* --- PMM TEST BLOCK ---
-    void* block1 = pmm_alloc_block();
-    void* block2 = pmm_alloc_block();
-
-    if (block1 != nullptr && block2 != nullptr && block1 != block2) 
-    {
-        print("PMM Status: ONLINE\n");
-        print("Allocated Block 1: "); print_hex((uint64_t)block1); putchar('\n');
-        print("Allocated Block 2: "); print_hex((uint64_t)block2); putchar('\n');
-
-
-        // Test the Freeing logic
-        pmm_free_block(block1);
-        void* block3 = pmm_alloc_block();
-
-        if (block3 == block1) {
-            print("PMM Reuse: SUCCESS\n\n");
-        } else {
-            print("PMM Reuse: FAILED (Unexpected Address)\n\n");
-        }
-        asm volatile("hlt");
-    } 
-    else 
-    {
-        color = 0x4F; // Red Screen
-        print("PMM CRITICAL FAILURE: Allocation failed or duplicate addresses!\n");
-        while(1) asm("hlt");
-    }
-    // -----------------------*/
+extern "C" void kernel_main() {
+    pmm_init(128 * 1024 * 1024, 0x180000);
+    for (uint64_t addr = 0x200000; addr < 128 * 1024 * 1024; addr += 4096) pmm_mark_free(addr);
 
     idt_init();
     pic_remap();
     heap_init();
-    /*for(int i = 0; i < 1000; i++) {
-    uint8_t* test = new uint8_t[1024]; // Allocate 1KB
-    delete[] test;                    // Free 1KB
-}
-print("Heap Stress Test: PASSED (No leakage)\n");
-asm volatile("hlt");*/
     
     extern void pic_clear_mask(uint8_t irq);
-    pic_clear_mask(1); // Enable Keyboard
-    // test_new_operator();
+    pic_clear_mask(1); // Keyboard
     
     asm volatile ("sti");
 
-    enable_cursor(0, 15);
     fs_init();
+    enable_cursor(1,15);
     splash_screen();
+    clear_screen();
+    //print("DOSnyx v2.6 Online\n");
     print_prompt();
 
-    while (true)
-    {
+    while (true) {
         char c = keyboard_getchar();
         if (!c) continue;
-
-        if (c == '\b') {
-            if (input_length > 0 && col > prompt_start_col) {
-                input_length--;
-                col--;
-                vga[row * VGA_WIDTH + col] = (color << 8) | ' ';
-                update_cursor();
+        if (c == '\n') handle_enter();
+        else if (c == '\b') {
+            if (input_length > 0 && col > prompt_start_col) { 
+                input_length--; col--; 
+                vga[row * VGA_WIDTH + col] = (color << 8) | ' '; 
+                update_cursor(); 
             }
         }
-        else if (c == '\n')
-            handle_enter();
-        else if (input_length < 255) {
-            input_buffer[input_length++] = c;
-            putchar(c);
-        }
+        else if (input_length < 255) { input_buffer[input_length++] = c; putchar(c); }
     }
 }
 
-/* ================ INTERRUPTS ================== */
-
-extern "C" void isr_dispatch(interrupt_frame* frame)
-{
-    color = 0x4F; 
-    clear_screen();
-
-    print("==== KERNEL PANIC ====\n\n");
-    print("Interrupt: "); print_hex(frame->int_no); putchar('\n');
-    print("Error:     "); print_hex(frame->err_code); putchar('\n');
-    print("RIP:       "); print_hex(frame->rip); putchar('\n');
-
-    if (frame->int_no == 14) {
-        uint64_t cr2;
-        asm volatile("mov %%cr2, %0" : "=r"(cr2));
-        print("Fault Addr: "); print_hex(cr2); putchar('\n');
-    }
-
+extern "C" void isr_dispatch(interrupt_frame* frame) {
+    color = 0x4F; clear_screen();
+    print("==== KERNEL PANIC ====\n");
+    print("Int: "); print_hex(frame->int_no);
+    print("\nRIP: "); print_hex(frame->rip);
     while (1) asm("hlt");
 }
+
+/* ================= INTERRUPT HANDLERS ================= */
+
+//extern "C" uint64_t timer_ticks; // Ensure this is accessible
 
 extern "C" void isr_timer()
 {
     timer_ticks++;
-    pic_send_eoi(0);
+    pic_send_eoi(0); // Tell the PIC we handled the timer interrupt
 }

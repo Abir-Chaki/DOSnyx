@@ -2,24 +2,25 @@
 
 #include <stdint.h>
 
-#define MAX_NODES 64
-
 struct Node {
-    char name[16];
-    bool used;
+    char name[32];
+    bool used;        // We keep this for safety, though 'new' handles existence
     bool is_folder;
-    int parent;
-
+    
+    Node* parent;     // Changed from 'int' to 'Node*'
+    Node* next;       // Link for the global list
+    
     char content[1024];
     int size;
 };
 
-extern Node nodes[MAX_NODES];
-extern int current_dir;
+// Externs for the globals used in vmkrnl.cpp
+extern Node* all_nodes_head;
+extern Node* current_dir_ptr;
 
 /* FS functions */
-int fs_find(const char* name);
-int fs_create(const char* name, bool folder);
+Node* fs_find(const char* name);
+Node* fs_create(const char* name, bool folder);
 void fs_delete(const char* name);
 
 /* String helper */

@@ -2,9 +2,9 @@ CXX = x86_64-elf-g++
 LD  = x86_64-elf-ld
 ASM = nasm
 
-CXXFLAGS = -ffreestanding -O2 -Wall -Wextra -std=gnu++20 \
-           -mno-red-zone -mcmodel=kernel \
-           -fno-pic -fno-exceptions -fno-rtti
+CXXFLAGS = -ffreestanding -O2 -Wall -Wextra -std=gnu++20 -mno-red-zone \
+           -mcmodel=kernel -fno-pic -fno-exceptions -fno-rtti \
+           -mno-sse -mno-sse2 -mno-mmx
 
 all: kernel.bin iso
 
