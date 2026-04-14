@@ -224,7 +224,7 @@ void print_prompt() {
 void show_cmds() {
     print("ver - Version Info\nabout - About DOSnyx\ncl - Clear screen\nrst - Reboot\n");
     print("dir - List files\ncreate <f> - New file\ndel <f> - Delete\nmf <f> - New folder\n");
-    print("cf <f> - Change folder\nusrnm - Current user\nwrite <f> - Notepad\n\n");
+    print("cf <f> - Change folder\nusrnm - Current user\nwrite <f> - Notepad\nsht - Shutdown\n\n");
 }
 
 void handle_enter() {
