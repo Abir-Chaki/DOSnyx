@@ -2,5 +2,5 @@
 #include <stddef.h>
 
 void heap_init();
-void* kmalloc(size_t size);
-void kfree(void* ptr);
+extern "C" void* kmalloc(size_t size);
+extern "C" void kfree(void* ptr);

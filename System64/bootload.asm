@@ -38,11 +38,12 @@ _start:
     mov ecx, 0
 .map:
     mov eax, ecx
-    shl eax, 21
-    or eax, 0b10000011
-    mov [pd_table + ecx*8], eax
+    shl eax, 21                 ; Multiply index by 2MB
+    or eax, 0b10000011          ; Present + Writeable + Huge Page
+    mov [pd_table + ecx*8], eax ; Write entry (8 bytes per entry in 64-bit)
+    
     inc ecx
-    cmp ecx, 1
+    cmp ecx, 512                ; Map 512 entries (1GB total)
     jne .map
 
     ; Enable PAE

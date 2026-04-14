@@ -13,7 +13,7 @@ void pmm_init(size_t mem_size, uint64_t bitmap_start) {
     }
 }
 void pmm_free_block(void* ptr) {
-    // This just calls our existing mark_free logic
+    // This just calls our existing mark_free logic 
     pmm_mark_free((uint64_t)ptr);
 }
 

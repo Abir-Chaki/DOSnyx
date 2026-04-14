@@ -32,8 +32,11 @@ write.o:
 pmm.o:
 	$(CXX) $(CXXFLAGS) -c System64/memory/pmm.cpp -o pmm.o
 
-kernel.bin: boot.o kernel.o idt.o pic.o heap.o keyboard.o write.o pmm.o
-	$(LD) -T linker.ld -nostdlib boot.o kernel.o idt.o pic.o heap.o keyboard.o write.o pmm.o -o kernel.bin
+newdelete.o:
+	$(CXX) $(CXXFLAGS) -c System64/newdelete.cpp -o newdelete.o
+
+kernel.bin: boot.o kernel.o idt.o pic.o heap.o keyboard.o write.o pmm.o newdelete.o
+	$(LD) -T linker.ld -nostdlib boot.o kernel.o idt.o pic.o heap.o keyboard.o write.o pmm.o newdelete.o -o kernel.bin
 
 iso: kernel.bin
 	mkdir -p isodir/boot/grub

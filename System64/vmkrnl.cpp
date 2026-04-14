@@ -7,6 +7,7 @@
 #include "drivers/keyboard.hpp"
 
 // Updated to include CPU-pushed registers for better Panic reporting
+
 struct interrupt_frame
 {
     uint64_t r11, r10, r9, r8;
@@ -139,6 +140,7 @@ extern "C" void print(const char* str)
         putchar(*str++);
 }
 
+
 /* ================= HELPERS ================= */
 
 bool strcmp_simple(const char* a, const char* b)
@@ -158,6 +160,31 @@ void print_hex(uint64_t val)
         putchar(hex[(val >> i) & 0xF]);
 }
 
+class Vector3 {
+public:
+    int x, y, z;
+    Vector3(int _x, int _y, int _z) : x(_x), y(_y), z(_z) {
+        // This confirms constructors are called
+    }
+};
+
+void test_new_operator() {
+    print("Testing C++ new... ");
+    
+    Vector3* v = new Vector3(10, 20, 30);
+
+    if (v->x == 10 && v->z == 30) {
+        print("SUCCESS! Value: ");
+        print_hex(v->y); // Should show 0x14 (20)
+        putchar('\n');
+    } else {
+        print("FAILED!\n");
+    }
+
+    delete v; // This calls your (currently empty) kfree
+    asm volatile("hlt");
+}
+
 /* ================= SPLASH ================= */
 
 void splash_screen()
@@ -165,7 +192,7 @@ void splash_screen()
     color = 0x1F;
     clear_screen();
     print("DOSnyx Operating System\n");
-    print("Version 2.3 (PMM Active)\n\n");
+    print("Version 2.5\n\n");
     print("Press any key to continue...");
     while (!keyboard_getchar());
     color = 0x0F;
@@ -270,7 +297,7 @@ void handle_enter()
 
     // ver
     if (strcmp_simple(input_buffer, "ver"))
-        print("DOSnyx Version 2.4\n\n");
+        print("DOSnyx Version 2.5\n\n");
 
     // about
     else if (strcmp_simple(input_buffer, "about"))
@@ -400,12 +427,19 @@ extern "C" void kernel_main()
     }
     // -----------------------*/
 
-    heap_init();
     idt_init();
     pic_remap();
+    heap_init();
+    /*for(int i = 0; i < 1000; i++) {
+    uint8_t* test = new uint8_t[1024]; // Allocate 1KB
+    delete[] test;                    // Free 1KB
+}
+print("Heap Stress Test: PASSED (No leakage)\n");
+asm volatile("hlt");*/
     
     extern void pic_clear_mask(uint8_t irq);
     pic_clear_mask(1); // Enable Keyboard
+    // test_new_operator();
     
     asm volatile ("sti");
 
