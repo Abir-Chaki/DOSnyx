@@ -29,8 +29,11 @@ heap.o:
 write.o:
 	$(CXX) $(CXXFLAGS) -c NyxApps/write.cpp -o write.o
 
-kernel.bin: boot.o kernel.o idt.o pic.o heap.o keyboard.o write.o
-	$(LD) -T linker.ld -nostdlib boot.o kernel.o idt.o pic.o heap.o keyboard.o write.o -o kernel.bin
+pmm.o:
+	$(CXX) $(CXXFLAGS) -c System64/memory/pmm.cpp -o pmm.o
+
+kernel.bin: boot.o kernel.o idt.o pic.o heap.o keyboard.o write.o pmm.o
+	$(LD) -T linker.ld -nostdlib boot.o kernel.o idt.o pic.o heap.o keyboard.o write.o pmm.o -o kernel.bin
 
 iso: kernel.bin
 	mkdir -p isodir/boot/grub
