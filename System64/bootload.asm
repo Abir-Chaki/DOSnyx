@@ -264,3 +264,37 @@ irq1_handler:
     pop rax
 
     iretq
+
+; =====================================
+; IRQ12 MOUSE
+; =====================================
+global irq12_handler
+extern isr_mouse
+
+irq12_handler:
+    push rax
+    push rcx
+    push rdx
+    push rbx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    call isr_mouse
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rbx
+    pop rdx
+    pop rcx
+    pop rax
+    iretq

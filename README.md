@@ -15,11 +15,16 @@ It runs in long mode, uses identity paging, and features a working interrupt sys
 * Full IDT (0–31 CPU Exceptions)
 * Page Fault Handler (with CR2 reporting)
 * PIC Remapping
+* Heap
+* PMM
 * Timer IRQ (IRQ0)
 * Keyboard IRQ (IRQ1)
+* Mouse IRQ (IRQ12)
+* TUI (Text User Interface)
 * Basic In-Memory Filesystem
 * Built-in Console
 * Notepad-style App (`write`)
+* Brainf**k Interpreter (`bf`)
 
 ---
 

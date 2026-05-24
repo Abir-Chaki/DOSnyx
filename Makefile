@@ -35,8 +35,14 @@ pmm.o:
 newdelete.o:
 	$(CXX) $(CXXFLAGS) -c System64/newdelete.cpp -o newdelete.o
 
-kernel.bin: boot.o kernel.o idt.o pic.o heap.o keyboard.o write.o pmm.o newdelete.o
-	$(LD) -T linker.ld -nostdlib boot.o kernel.o idt.o pic.o heap.o keyboard.o write.o pmm.o newdelete.o -o kernel.bin
+tui.o:
+	$(CXX) $(CXXFLAGS) -c System64/drivers/tui.cpp -o tui.o
+
+bf.o:
+	$(CXX) $(CXXFLAGS) -c NyxApps/bf.cpp -o bf.o
+
+kernel.bin: boot.o kernel.o idt.o pic.o heap.o keyboard.o write.o pmm.o newdelete.o tui.o bf.o
+	$(LD) -T linker.ld -nostdlib boot.o kernel.o idt.o pic.o heap.o keyboard.o write.o pmm.o newdelete.o tui.o bf.o -o kernel.bin
 
 iso: kernel.bin
 	mkdir -p isodir/boot/grub

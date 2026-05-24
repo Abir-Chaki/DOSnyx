@@ -17,6 +17,7 @@ extern "C" {
 
     void irq0_handler();
     void irq1_handler();
+    void irq12_handler();
 }
 
 static void set_idt_gate(int n, uint64_t handler)
@@ -70,6 +71,7 @@ extern "C" void idt_init()
 
     set_idt_gate(32, (uint64_t)irq0_handler);
     set_idt_gate(33, (uint64_t)irq1_handler);
+    set_idt_gate(44, (uint64_t)irq12_handler);
 
     load_idt((uint64_t)&idt_ptr);
 }
