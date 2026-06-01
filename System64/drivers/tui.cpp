@@ -34,7 +34,7 @@ void draw_taskbar() {
     // Row 0: Dark Blue Title bar with centered text
     for (int i = 0; i < 80; i++) vga[i] = (0x1F << 8) | ' '; 
     
-    const char* title = "DOSnyx Operating System v3.0";
+    const char* title = "DOSnyx Operating System v3.5";
     int len = 0; while(title[len]) len++;
     int start_x = (80 - len) / 2;
     for (int i = 0; i < len; i++) vga[start_x + i] = (0x1F << 8) | title[i];

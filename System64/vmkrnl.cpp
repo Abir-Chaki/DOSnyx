@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include "../NyxApps/write.hpp"
 #include "fs.hpp"
 #include "memory/heap.hpp"
 #include "memory/pmm.hpp"
@@ -6,13 +7,17 @@
 #include "drivers/pic.hpp"
 #include "drivers/keyboard.hpp"
 #include "drivers/tui.hpp"
+#include "drivers/disk.hpp"
+#include "drivers/nyxfs.hpp"
+#include "drivers/io.hpp"
+#include "drivers/fat.hpp"
 
 struct interrupt_frame {
     uint64_t r11, r10, r9, r8, rdi, rsi, rbp, rbx, rdx, rcx, rax;
     uint64_t int_no, err_code, rip, cs, rflags, rsp, ss;
 }; 
 
-extern void notepad(Node* file_node); 
+// extern void notepad(Node* file_node); 
 extern "C" void run_bf(Node* file_node);
 extern "C" void kernel_main(); 
 
@@ -40,6 +45,13 @@ static int active_selection = 0;
 /* ================= FILE SYSTEM GLOBALS ================= */
 Node* all_nodes_head = nullptr; 
 Node* current_dir_ptr = nullptr; 
+Node* system_root = nullptr;
+uint16_t fat_current_cluster; 
+char fat_current_path[64] = "";
+
+/* ================= STORAGE ENGINE STORAGE REGISTERS ================= */
+DriveState system_drives[MAX_DRIVES];
+int current_drive_id = 1; // Default to drive 1: on boot
 
 /* ================= MOUSE GLOBALS ================= */
 static uint8_t mouse_cycle = 0;
@@ -63,23 +75,91 @@ bool strcmp_simple(const char* a, const char* b) {
     }
     return (*a == 0 && *b == 0); 
 }
+const char* get_filename_only(const char* full_path) {
+    int len = 0;
+    while (full_path[len] != '\0') len++;
 
-static inline uint8_t inb(uint16_t port) {
-    uint8_t ret;
-    asm volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port)); 
-    return ret; 
+    // Scan backwards for the last slash
+    for (int i = len - 1; i >= 0; i--) {
+        if (full_path[i] == '/') {
+            return &full_path[i + 1];
+        }
+    }
+    return full_path; // No directory path found, already top-level
 }
 
-static inline void outb(uint16_t port, uint8_t value) {
-    asm volatile ("outb %0, %1" : : "a"(value), "Nd"(port)); 
-}
-static inline void outw(uint16_t port, uint16_t value) {
-    asm volatile ("outw %0, %1" : : "a"(value), "Nd"(port)); 
-}
 extern "C" void* memset(void* dest, int val, size_t len) {
     unsigned char* ptr = (unsigned char*)dest;
     while (len-- > 0) *ptr++ = (unsigned char)val;
     return dest;
+}
+
+void FATConvertToCaps(char* dest, const char* src, int max_len) {
+    int i = 0;
+    while (src[i] != '\0' && i < (max_len - 1)) {
+        char c = src[i];
+        if (c >= 'a' && c <= 'z') {
+            dest[i] = c - 32; // Convert lowercase to ASCII uppercase
+        } else {
+            dest[i] = c;
+        }
+        i++;
+    }
+    dest[i] = '\0'; // Ensure it's safely null-terminated
+}
+
+bool IsValidFATName(const char* name) {
+    if (name[0] == '\0') return false;
+    if (strcmp_simple(name, ".") || strcmp_simple(name, "..")) return false;
+
+    int dot_count = 0;
+
+    for (int i = 0; name[i] != '\0'; i++) {
+        char c = name[i];
+
+        // Block slashes, quotes, wildcards, and stream redirection tokens
+        if (c == '/'  || c == '\\' || c == '"' || 
+            c == '?'  || c == '*'  || c == ':' || 
+            c == '<'  || c == '>' || c == '\n') {
+            return false;
+        }
+
+        if (c == '.') {
+            dot_count++;
+            if (i == 0 || dot_count > 1) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+bool ends_with_bf(const char* name) {
+    int len = 0;
+    while (name[len] != '\0') len++;
+    if (len < 3) return false;
+    
+    // Check for .BF or .bf extension bounds
+    return (name[len-3] == '.' && 
+           (name[len-2] == 'B' || name[len-2] == 'b') && 
+           (name[len-1] == 'F' || name[len-1] == 'f'));
+}
+
+extern "C" void print(const char* str);
+extern "C" void putchar(char c);
+
+void print_int(int val) {
+    if (val == 0) {
+        putchar('0');
+        return;
+    }
+    char buf[12];
+    int i = 10;
+    buf[11] = '\0';
+    while (val > 0 && i >= 0) {
+        buf[i--] = (val % 10) + '0';
+        val /= 10;
+    }
+    print(&buf[i + 1]);
 }
 
 /* ================= SCREEN CONTROL ================= */
@@ -138,7 +218,7 @@ void enable_cursor(uint8_t start, uint8_t end) {
 void splash_screen() {
     color = 0x1F; clear_screen(); 
     print("DOSnyx Operating System\n"); 
-    print("Version 3.0 (TUI Engine)\n\n"); 
+    print("Version 3.5\n\n"); 
     print("Press any key to boot the system desktop..."); 
     while (!keyboard_getchar()); 
     color = 0x0F;
@@ -160,23 +240,51 @@ void hard_reboot() {
 /* ================= DYNAMIC FS CORE ================= */
 
 void fs_init() {
-    print("Allocating Root... "); 
+    print("Allocating Root... ");
     Node* root = new Node(); 
     if (root == nullptr) {
-        color = 0x1F; print("CRITICAL: Heap returned NULL for Root Node!\n"); 
+        color = 0x1F;
+        print("CRITICAL: Heap returned NULL for Root Node!\n"); 
         while(1) asm("hlt"); 
     }
     print("Address: "); print_hex((uint64_t)root); putchar('\n'); 
     kstrncpy(root->name, "root", 15);
     root->is_folder = true; root->parent = nullptr; 
     root->next = nullptr; root->size = 0; 
-    all_nodes_head = root; current_dir_ptr = root; 
+    all_nodes_head = root; current_dir_ptr = root;
+    system_root = root;
+
+    // Initialize all physical drive slots dynamically
+    for (int i = 0; i < MAX_DRIVES; i++) {
+        system_drives[i].id = i + 1;
+        if (i == 0) {
+            system_drives[i].is_mounted = true; // Drive 1 is our live RAM system
+            kstrncpy(system_drives[i].current_path, "root", 5);
+        } else {
+            system_drives[i].is_mounted = false; // Primary offline placeholders
+            system_drives[i].current_path[0] = '\0';
+        }
+    }
 }
 
 Node* fs_find(const char* name) {
+    char full_path[64];
+    full_path[0] = '\0';
+    
+    // Construct lookup path based on our working location context
+    if (current_dir_ptr != all_nodes_head) { // If not inside root
+        kstrncpy(full_path, current_dir_ptr->name, 32);
+        int len = 0; while (full_path[len]) len++;
+        full_path[len] = '/';
+        full_path[len + 1] = '\0';
+    }
+    // Append target name
+    int base_len = 0; while (full_path[base_len]) base_len++;
+    kstrncpy(&full_path[base_len], name, 32);
+
     Node* curr = all_nodes_head;
     while (curr != nullptr) {
-        if (curr->parent == current_dir_ptr && strcmp_simple(curr->name, name)) return curr; 
+        if (strcmp_simple(curr->name, full_path) || strcmp_simple(curr->name, name)) return curr; 
         curr = curr->next; 
     }
     return nullptr;
@@ -184,9 +292,25 @@ Node* fs_find(const char* name) {
 
 Node* fs_create(const char* name, bool folder) {
     Node* newNode = new Node(); 
-    kstrncpy(newNode->name, name, 15);
-    newNode->is_folder = folder; newNode->parent = current_dir_ptr; 
-    newNode->size = 0; newNode->content[0] = 0; 
+    newNode->is_folder = folder; 
+    newNode->size = 0; 
+    newNode->content[0] = 0; 
+    newNode->parent = current_dir_ptr;
+
+    // FIX: Check against the permanent system_root pointer instead of head
+    if (current_dir_ptr == system_root || strcmp_simple(current_dir_ptr->name, "root")) {
+        kstrncpy(newNode->name, name, 15); 
+    } else {
+        char path_buf[64];
+        kstrncpy(path_buf, current_dir_ptr->name, 32);
+        int len = 0; while (path_buf[len]) len++;
+        path_buf[len] = '/';
+        kstrncpy(&path_buf[len + 1], name, 31 - len);
+        kstrncpy(newNode->name, path_buf, 15); 
+    }
+
+    print("\n[ALLOC] Name allocated: "); print(newNode->name); print("\n");
+
     newNode->next = all_nodes_head; 
     all_nodes_head = newNode;
     return newNode; 
@@ -213,62 +337,372 @@ void print_path(Node* dir) {
 
 void print_prompt() {
     if (col != 0) putchar('\n');
-    print("1:/"); print_path(current_dir_ptr); print("> ");
-    prompt_start_col = col; input_length = 0;
+    
+    // Output the current drive letter assignment dynamically
+    print_int(current_drive_id);
+    print(":/");
+    
+    // Display paths depending on which storage driver is active
+    if (current_drive_id == 1) {
+        print_path(current_dir_ptr);
+    } else {
+        // Render the active FAT subfolder path string
+        print(fat_current_path);
+    }
+    
+    print("> ");
+    prompt_start_col = col; 
+    input_length = 0;
 }
 
 void show_cmds() {
     print("ver - Version Info\nabout - About DOSnyx\ncl - Clear window workspace\nrst - Reboot\n");
     print("dir - List files\ncreate <f> - New file\ndel <f> - Delete\nmf <f> - New folder\n");
     print("cf <f> - Change folder\nusrnm - Current user\nwrite <f> - Notepad\nbf <f> - Brainf**k Interpreter\n");
+    print("dt - DOSnyx Disk Diagnostics\n\n");
 }
 
 void handle_enter() {
     input_buffer[input_length] = 0; putchar('\n');
-    if (strcmp_simple(input_buffer, "ver")) print("DOSnyx Version 3.0\n\n");
+
+    // =========================================================================
+    // DRIVE SWITCHER INTERCEPTOR (e.g., 1:, 2:, 3:, 4:)
+    // =========================================================================
+    if (input_length == 2 && input_buffer[1] == ':') {
+        int target_drive = input_buffer[0] - '0'; // Translate ASCII character back to integer
+
+        if (target_drive >= 1 && target_drive <= MAX_DRIVES) {
+            if (target_drive == 1) {
+                fat_current_path[0] = '\0';
+                current_drive_id = target_drive;
+                print("Switched to NyxFS Drive.\n\n");
+            } 
+            else {
+                // Secondary Drive Handling Check
+                if (!system_drives[target_drive - 1].is_mounted) {
+                    print("Probing drive hardware sector tables... \n");
+                    
+                    // 1. Temporarily save the old drive ID context
+                    int old_drive = current_drive_id;
+                    // 2. Set the global drive context so disk.cpp targets the correct hardware registers
+                    current_drive_id = target_drive; 
+                    
+                    if (FAT::mount_drive()) {
+                        system_drives[target_drive - 1].is_mounted = true; 
+                        fat_current_path[0] = '\0';
+                        fat_current_cluster = 0;
+                        color = 0x0A; // Green indicator text
+                        print("FAT Volume mounted successfully!\n\n");
+                        color = 0x0F;
+                    } else {
+                        color = 0x0C; // Red error text
+                        print("FAT mount failed: Missing MBR signature or bad boot sector.\n\n");
+                        color = 0x0F;
+                        // 3. Rollback the drive ID context if the hardware validation failed
+                        current_drive_id = old_drive; 
+                    }
+                } else {
+                    current_drive_id = target_drive;
+                    print("Switched to Volume Layer.\n\n");
+                }
+            }
+        } else {
+            color = 0x0C; // Red warning text
+            print("Error: Invalid drive target range (1-4).\n\n");
+            color = 0x0F;
+        }
+        print_prompt();
+        return; // Break execution out early and draw prompt
+    }
+
+    // =========================================================================
+    // GENERAL UTILITY COMMANDS (Globally Accessible across ALL drives)
+    // =========================================================================
+    if (strcmp_simple(input_buffer, "ver")) print("DOSnyx Version 3.5\n\n");
     else if (strcmp_simple(input_buffer, "about")) print("DOSnyx: Hybrid Kernel Concept\nBy Abir Chaki | 13 y/o Dev | India\n\n");
     else if (strcmp_simple(input_buffer, "cl")) { clear_workspace(); print_prompt(); return; } 
     else if (strcmp_simple(input_buffer, "rst")) hard_reboot();
     else if (strcmp_simple(input_buffer, "usrnm")) { print(username); print("\n\n"); } 
     else if (strcmp_simple(input_buffer, "cmds")) show_cmds();
-    else if (input_length > 3 && input_buffer[0]=='b' && input_buffer[1]=='f') {
-        Node* target = fs_find(&input_buffer[3]);
-        if (target && !target->is_folder) {
-            run_bf(target);
-        } else {
-            print("BF file not found.\n");
-        }
-    }
-    else if (strcmp_simple(input_buffer, "dir")) {
-        Node* curr = all_nodes_head;
-        while (curr != nullptr) {
-            if (curr->parent == current_dir_ptr) {
-                print(curr->is_folder ? "[DIR]  " : "[FILE] "); print(curr->name); putchar('\n'); 
+    else if (input_length >= 6 && input_buffer[0] == 'f' && input_buffer[1] == 'o' && 
+             input_buffer[2] == 'r' && input_buffer[3] == 'm' && input_buffer[4] == 'a' && input_buffer[5] == 't') {
+        
+        int target_drive = current_drive_id; // Default to active drive context
+
+        // Check if the user specified an argument (e.g., "format 2:")
+        if (input_length >= 9 && input_buffer[6] == ' ' && input_buffer[8] == ':') {
+            char drive_char = input_buffer[7];
+            if (drive_char >= '1' && drive_char <= '4') {
+                target_drive = drive_char - '0';
             }
-            curr = curr->next; 
         }
-        putchar('\n');
+
+        if (target_drive == 1) {
+            color = 0x0C; // Crimson Red
+            print("Error: Formatting restricted on Native System Root (1:).\n\n");
+            color = 0x0F;
+        } else {
+            color = 0x0E; // Alert Yellow
+            print("WARNING: Preparing low-level sector write allocation format!\n");
+            print("Targeting virtual device track drive assignment "); print_int(target_drive); print(":\n");
+            color = 0x0F;
+
+            // Explicitly set the drive configuration before formatting sectors
+            int old_drive = current_drive_id;
+            current_drive_id = target_drive;
+            
+            if (FAT::format_drive()) {
+                color = 0x0A; // Green
+                print("\nFormat Complete! Sector maps written successfully.\n");
+                print("Attempting live volume re-mount... \n");
+                color = 0x0F;
+                
+                if (FAT::mount_drive()) {
+                    print("Drive successfully mounted and ready for file allocations!\n\n");
+                } else {
+                    print("Mount sync anomaly detected following low-level clear.\n\n");
+                }
+            } else {
+                color = 0x0C;
+                print("\nCritical Error: Physical driver disk allocation write handshake failed.\n\n");
+                color = 0x0F;
+                current_drive_id = old_drive; // Roll back on hard hardware failure
+            }
+        }
     }
-    else if (input_length > 7 && input_buffer[0]=='c' && input_buffer[1]=='r') { fs_create(&input_buffer[7], false); print("File created.\n\n"); } 
-    else if (input_length > 4 && input_buffer[0]=='d' && input_buffer[1]=='e') { fs_delete(&input_buffer[4]); print("Deleted.\n\n"); } 
-    else if (input_length > 3 && input_buffer[0]=='m' && input_buffer[1]=='f') { fs_create(&input_buffer[3], true); print("Folder created.\n\n"); } 
-    else if (input_length > 3 && input_buffer[0]=='c' && input_buffer[1]=='f') {
-        if (input_buffer[3]=='.' && input_buffer[4]=='.') { if (current_dir_ptr->parent != nullptr) current_dir_ptr = current_dir_ptr->parent; }
-        else { Node* target = fs_find(&input_buffer[3]); if (target && target->is_folder) current_dir_ptr = target; else print("Folder not found.\n\n"); } 
-    }
-    else if (input_length > 8 && input_buffer[0]=='p' && input_buffer[1]=='r' && input_buffer[2]=='n') { print(&input_buffer[8]); print("\n\n"); } 
-    else if (input_length > 6 && input_buffer[0]=='w' && input_buffer[1]=='r') {
-        Node* target = fs_find(&input_buffer[6]); if (!target) target = fs_create(&input_buffer[6], false);
-        notepad(target); 
-    }
+    else if (strcmp_simple(input_buffer, "sync")) NyxFS::sync();
     else if (strcmp_simple(input_buffer, "sht")) {
-        clear_workspace(); color = 0x0E; print("Shutting down\n"); 
+        clear_workspace();
+        color = 0x0E; print("Shutting down\n"); 
         for(volatile uint64_t i = 0; i < 900000000; i++) asm volatile("nop"); 
-        outw(0xB004, 0x2000); outw(0x604, 0x2000); outw(0x4004, 0x3400); 
-        color = 0x1F; print("\nIt is now safe to turn off the computer.\n"); while(1) asm("hlt"); 
+        outw(0xB004, 0x2000); outw(0x604, 0x2000);
+        outw(0x4004, 0x3400); 
+        color = 0x1F; print("\nIt is now safe to turn off the computer.\n"); while(1) asm("hlt");
     }
-    else if (input_length > 0) print("Unknown command\n\n");
-    print_prompt(); 
+    else if (strcmp_simple(input_buffer, "dt")) {
+        print("--- DOSnyx Disk Driver Diagnostics ---\n");
+        print("Initializing IDE controller... ");
+        if (!Disk::init()) {
+            color = 0x0C; print("FAILED! No IDE hard drive detected.\n\n"); color = 0x0F;
+            return;
+        }
+        color = 0x0A; print("SUCCESS!\n"); color = 0x0F;
+        
+        uint8_t write_buffer[512];
+        for (int i = 0; i < 512; i++) write_buffer[i] = 0;
+        const char* test_msg = "DOSnyx Bare-Metal Disk Write Verification: SUCCESS! Driver is alive.";
+        int msg_len = 0;
+        while (test_msg[msg_len]) { write_buffer[msg_len] = test_msg[msg_len]; msg_len++; }
+
+        print("Writing verification token to Sector 10... ");
+        if (!Disk::write_sector(10, write_buffer)) {
+            color = 0x0C; print("FAILED during PIO write handshake.\n\n"); color = 0x0F;
+            return;
+        }
+        print("Done.\n");
+        
+        uint8_t read_buffer[512];
+        for (int i = 0; i < 512; i++) read_buffer[i] = 0xAA;
+        print("Reading verification token back from Sector 10... ");
+        if (!Disk::read_sector(10, read_buffer)) {
+            color = 0x0C; print("FAILED during PIO read handshake.\n\n"); color = 0x0F;
+            return;
+        }
+        print("Done.\n\n");
+        print("Data recovered from disk hardware:\n-> \"");
+        color = 0x0E; print((char*)read_buffer); color = 0x0F; print("\"\n\n");
+    }
+    /// =========================================================================
+    // FILESYSTEM SPECIFIC COMMANDS (Context routing based on current_drive_id)
+    // =========================================================================
+    
+    // Track the active subdirectory cluster for FAT operations globally across shell steps
+
+
+    // =========================================================================
+    // DIRECTORY MAPPING ROUTER (Supports Native RAM Node Paths & Raw FAT Disks)
+    // =========================================================================
+    // =========================================================================
+    // DIRECTORY MAPPING ROUTER 
+    // =========================================================================
+    else if (strcmp_simple(input_buffer, "dir")) {
+        if (current_drive_id == 1) {
+            // [Drive 1 Local NyxFS logic remains exactly the same...]
+            Node* curr = all_nodes_head;
+            bool files_found = false;
+            while (curr != nullptr) {
+                bool should_display = false;
+                if (current_dir_ptr == system_root || strcmp_simple(current_dir_ptr->name, "root")) {
+                    should_display = true;
+                    for (int i = 0; curr->name[i] != '\0'; i++) {
+                        if (curr->name[i] == '/') { should_display = false; break; }
+                    }
+                } else {
+                    int dir_len = 0; while (current_dir_ptr->name[dir_len]) dir_len++;
+                    should_display = true;
+                    for (int i = 0; i < dir_len; i++) {
+                        if (curr->name[i] != current_dir_ptr->name[i]) { should_display = false; break; }
+                    }
+                    if (should_display && curr->name[dir_len] != '/') { should_display = false; }
+                }
+                if (should_display && !strcmp_simple(curr->name, "root")) {
+                    files_found = true;
+                    print(curr->is_folder ? "[DIR]  " : "[FILE] ");
+                    print(get_filename_only(curr->name)); putchar('\n'); 
+                }
+                curr = curr->next;
+            }
+            if (!files_found) print(" (Directory is empty)\n");
+            putchar('\n');
+        } 
+        else {
+            // -----------------------------------------------------------------
+            // DRIVES 2, 3, 4: Real-Time Raw Hardware Sector Block Parser
+            // -----------------------------------------------------------------
+            print("Directory listing for FAT Volume (Drive "); 
+            print_int(current_drive_id); print(":):\n");
+            
+            // Note: If your FAT driver allows you to pass a callback or handles filtering,
+            // make sure it drops entries starting with '.'. 
+            // If list_directory prints raw, you can clear the workspace or use the TUI File Manager
+            // which now has complete string-safety processing.
+            FAT::list_directory(fat_current_cluster);
+            putchar('\n');
+        }
+    }
+    else if (input_length > 7 && input_buffer[0]=='c' && input_buffer[1]=='r') { 
+        if (current_drive_id == 1) { 
+            fs_create(&input_buffer[7], false); 
+            print("File created on NyxFS.\n\n"); 
+            NyxFS::sync(); 
+        }
+        else { 
+            const char* arg = &input_buffer[7];
+            
+            // Validate forbidden characters (/ , " , illegal dots, \0)
+            if (!IsValidFATName(arg)) {
+                color = 0x0C; // Red error
+                print("Error: Filename contains forbidden characters or invalid dots.\n\n");
+                color = 0x0F;
+            } else {
+                char upper_name[32];
+                FATConvertToCaps(upper_name, arg, 32);
+
+                if (FAT::create_file(upper_name, false, fat_current_cluster)) {
+                    print("File created on FAT volume.\n\n");
+                } else {
+                    print("Error: Failed to register entry allocation slot.\n\n");
+                }
+            }
+        }
+    } 
+    else if (input_length > 4 && input_buffer[0]=='d' && input_buffer[1]=='e') { 
+        if (current_drive_id == 1) { 
+            fs_delete(&input_buffer[4]); 
+            print("Deleted from NyxFS.\n\n"); 
+            NyxFS::sync(); 
+        }
+        else { 
+            const char* arg = &input_buffer[4];
+            
+            // Normalize the target deletion argument to uppercase
+            char upper_name[32];
+            FATConvertToCaps(upper_name, arg, 32);
+
+            print("Searching storage tables for entry: ");
+            print(upper_name);
+            putchar('\n');
+
+            // Invoke our low-level sector modification sequence
+            if (FAT::delete_entry(upper_name, fat_current_cluster)) {
+                color = 0x0A; // Green success text
+                print("Entry unlinked and clusters marked free successfully.\n\n");
+                color = 0x0F;
+            } else {
+                color = 0x0C; // Red error text
+                print("Error: Could not locate target file or directory layout entry.\n\n");
+                color = 0x0F;
+            }
+        }
+    }
+    else if (input_length > 3 && input_buffer[0]=='m' && input_buffer[1]=='f') { 
+        if (current_drive_id == 1) { 
+            fs_create(&input_buffer[3], true); 
+            print("Folder created on NyxFS.\n\n"); 
+            NyxFS::sync(); 
+        }
+        else { 
+            const char* arg = &input_buffer[3];
+            
+            // Validate forbidden characters (/ , " , illegal dots, \0)
+            if (!IsValidFATName(arg)) {
+                color = 0x0C; // Red error
+                print("Error: Directory name contains forbidden characters or invalid dots.\n\n");
+                color = 0x0F;
+            } else {
+                char upper_name[32];
+                FATConvertToCaps(upper_name, arg, 32);
+
+                if (FAT::create_file(upper_name, true, fat_current_cluster)) {
+                    print("Folder created on FAT volume.\n\n");
+                } else {
+                    print("Error: Failed to write directory entry data.\n\n");
+                }
+            }
+        }
+    }
+    else if (input_length > 3 && input_buffer[0]=='c' && input_buffer[1]=='f') {
+        if (current_drive_id == 1) {
+            if (input_buffer[3]=='.' && input_buffer[4]=='.') { 
+                if (current_dir_ptr->parent != nullptr) current_dir_ptr = current_dir_ptr->parent;
+            }
+            else { 
+                Node* target = fs_find(&input_buffer[3]);
+                if (target && target->is_folder) current_dir_ptr = target; else print("Folder not found.\n\n");
+            } 
+        }
+        else {
+            if (input_buffer[3]=='.' && input_buffer[4]=='.') {
+                fat_current_cluster = 0;
+                fat_current_path[0] = '\0'; // Reset path prompt tracker back to root
+                print("Returned back to FAT root location index.\n\n");
+            }
+            else {
+                char upper_name[32];
+                FATConvertToCaps(upper_name, &input_buffer[3], 32);
+
+                if (FAT::traverse_directory(upper_name, fat_current_cluster)) {
+                    // Safely append the clean uppercase folder name to our prompt path
+                    int len = 0;
+                    while (fat_current_path[len] != '\0') len++;
+                    
+                    int i = 0;
+                    while (upper_name[i] != '\0' && (len + i) < 60) {
+                        fat_current_path[len + i] = upper_name[i];
+                        i++;
+                    }
+                    fat_current_path[len + i] = '/';     
+                    fat_current_path[len + i + 1] = '\0'; 
+                    
+                    print("Switched working cluster path target map.\n\n");
+                } else {
+                    print("Directory not found on FAT volume.\n\n");
+                }
+            }
+        }
+    }
+    else if (input_length > 8 && input_buffer[0]=='p' && input_buffer[1]=='r' && input_buffer[2]=='n') { 
+        print(&input_buffer[8]); print("\n\n"); 
+    } 
+    else if (input_length > 6 && input_buffer[0] == 'w' && input_buffer[1] == 'r') {
+        // Instead of finding nodes and calling notepad(target), call the app manager!
+        write_app_start(&input_buffer[6]);
+    }
+    else if (input_length > 0) {
+        print("Unknown command\n\n");
+    }
+
+    print_prompt();
 }
 
 /* ================= MOUSE LOGIC ================= */
@@ -283,6 +717,32 @@ void draw_mouse() {
         mouse_back[0][0] = vga[mouse_y * 80 + mouse_x];
         vga[mouse_y * 80 + mouse_x] = (0x0F << 8) | 0x11; 
     }
+}
+struct FATCacheEntry {
+    char name[13];      // 8.3 format + null terminator
+    bool is_folder;
+    uint16_t cluster;
+    uint32_t size;
+};
+
+static FATCacheEntry fat_dir_cache[64];
+static int fat_cache_count = 0;
+
+// Callback function for your FAT driver to populate the UI cache
+void fat_ui_cache_callback(const char* name, bool is_dir, uint16_t cluster, uint32_t size) {
+    if (fat_cache_count >= 64) return;
+    
+    // Copy name securely
+    int i = 0;
+    for (; name[i] != '\0' && i < 12; i++) {
+        fat_dir_cache[fat_cache_count].name[i] = name[i];
+    }
+    fat_dir_cache[fat_cache_count].name[i] = '\0';
+    
+    fat_dir_cache[fat_cache_count].is_folder = is_dir;
+    fat_dir_cache[fat_cache_count].cluster = cluster;
+    fat_dir_cache[fat_cache_count].size = size;
+    fat_cache_count++;
 }
 
 void execute_tui_app() {
@@ -299,7 +759,7 @@ void execute_tui_app() {
     }
     
     // =========================================================================
-    // OPTION 2: [2] FILE MANAGER (WITH MOUSE & DIRECTORY TRAVERSAL)
+    // OPTION 2: [2] FILE MANAGER (FULL INTERACTIVE NYXFS & FAT16 NAVIGATION)
     // =========================================================================
     else if (active_selection == 1) {
         int selected_file_index = 0;
@@ -308,130 +768,359 @@ void execute_tui_app() {
         outb(0x3D4, 0x0A); outb(0x3D5, 0x20);
 
         bool in_file_manager = true;
-        bool force_redraw = true; // High initially to draw the layout on launch
+        bool force_redraw = true; 
+        bool in_root_view = true; // State tracker starting at "This PC"
 
         while (in_file_manager) {
-            // Gather all local directory nodes matching current path scope
             Node* local_nodes[64]; 
             int total_files = 0;
-            bool has_back_link = (current_dir_ptr->parent != nullptr);
-            
-            Node* curr = all_nodes_head;
-            while (curr != nullptr && total_files < 64) {
-                if (curr->parent == current_dir_ptr) {
-                    local_nodes[total_files++] = curr;
+            bool has_back_link = !in_root_view;
+
+            // 1. Gather File Lists based on the active storage partition
+            if (!in_root_view) {
+                if (current_drive_id == 1) {
+                    // ---------------------------------------------------------
+                    // NYXFS FILES POPULATION
+                    // ---------------------------------------------------------
+                    Node* curr = all_nodes_head;
+                    while (curr != nullptr && total_files < 64) {
+                        bool match = false;
+                        if (current_dir_ptr == all_nodes_head || strcmp_simple(current_dir_ptr->name, "root")) {
+                            match = true;
+                            for (int i = 0; curr->name[i] != '\0'; i++) {
+                                if (curr->name[i] == '/') { match = false; break; }
+                            }
+                        } else {
+                            int d_len = 0; while (current_dir_ptr->name[d_len]) d_len++;
+                            match = true;
+                            for (int i = 0; i < d_len; i++) {
+                                if (curr->name[i] != current_dir_ptr->name[i]) { match = false; break; }
+                            }
+                            if (match && curr->name[d_len] != '/') { match = false; }
+                        }
+
+                        if (match && !strcmp_simple(curr->name, "root")) {
+                            local_nodes[total_files++] = curr;
+                        }
+                        curr = curr->next;
+                    }
+                } 
+                else {
+                    // ---------------------------------------------------------
+                    // FAT16 CLUSTER POPULATION (READING CACHE FROM HARD DISK)
+                    // ---------------------------------------------------------
+                    fat_cache_count = 0;
+                    
+                    // Populate fat_dir_cache array via sector mapping call
+                    FAT::list_directory_to_cache(fat_current_cluster, fat_ui_cache_callback);
+                    
+                    // Filter out corrupt dot files directly from the live loop count
+                    int valid_count = 0;
+                    for (int i = 0; i < fat_cache_count; i++) {
+                        // If the entry name starts with a dot, skip showing it entirely
+                        if (fat_dir_cache[i].name[0] == '.') {
+                            continue;
+                        }
+                        if (valid_count != i) {
+                            fat_dir_cache[valid_count] = fat_dir_cache[i];
+                        }
+                        valid_count++;
+                    }
+                    fat_cache_count = valid_count;
+                    total_files = fat_cache_count;
                 }
-                curr = curr->next;
             }
 
-            int rendering_bound = total_files + (has_back_link ? 1 : 0);
+            // 2. Bound checking for dynamic indexing limits
+            int rendering_bound = 0;
+            if (in_root_view) {
+                rendering_bound = 4; // Drives 1:, 2:, 3:, 4:
+            } else {
+                rendering_bound = total_files + (has_back_link ? 1 : 0);
+            }
+
             if (selected_file_index >= rendering_bound && rendering_bound > 0) {
                 selected_file_index = rendering_bound - 1;
             }
 
-            // Only overwrite VGA text mode memory if a redraw is explicitly requested
+            // =================================================================
+            // VGA WORKSPACE DRAW ENGINE
+            // =================================================================
             if (force_redraw) {
                 clear_workspace();
                 print("--- File Manager Workspace ---\n");
                 print("[TAB]: Cycle Selection | [ENTER / Left Click]: Open | [ESC]: Exit\n");
-                print("Current Directory: /"); print_path(current_dir_ptr); print("\n");
+                
+                if (in_root_view) {
+                    print("Current Location: This PC\n");
+                } else {
+                    print("Current Location: "); print_int(current_drive_id); print(":/");
+                    if (current_drive_id == 1) print_path(current_dir_ptr);
+                    else print(fat_current_path);
+                    print("\n");
+                }
                 print("------------------------------------------------------------------------\n\n");
                 
-                int base_row = row; 
                 int current_render_idx = 0;
 
-                // Render parent directory link if applicable
-                if (has_back_link) {
-                    color = (selected_file_index == 0) ? 0x3F : 0x0F; // Cyan highlight if selected
-                    print(" [DIR]  ../ [Go Back to Parent]");
-                    for (int p = 31; p < 79; p++) putchar(' ');
-                    putchar('\n');
-                    current_render_idx++;
+                if (in_root_view) {
+                    // RENDER "THIS PC" DRIVES MATRIX
+                    for (int d = 1; d <= 4; d++) {
+                        color = (selected_file_index == current_render_idx) ? 0x3F : 0x0F;
+                        print(" [DISK]  Drive "); print_int(d); print(": ");
+                        if (d == 1) print("[NysFS. System Root]");
+                        else print(system_drives[d-1].is_mounted ? "[Mounted FAT16 Partition]" : "[Offline Hard Platter. Click to Mount]");
+                        
+                        for (int p = col; p < 79; p++) putchar(' ');
+                        putchar('\n');
+                        current_render_idx++;
+                    }
+                } 
+                else {
+                    // RENDER BACK LINK (../)
+                    if (has_back_link) {
+                        color = (selected_file_index == 0) ? 0x3F : 0x0F;
+                        print(" [DIR]  ../ [Go to Parent Node Directory]");
+                        for (int p = col; p < 79; p++) putchar(' ');
+                        putchar('\n');
+                        current_render_idx++;
+                    }
+
+                    // RENDER NYXFS PATH
+                    if (current_drive_id == 1) {
+                        for (int i = 0; i < total_files; i++) {
+                            color = (selected_file_index == current_render_idx) ? 0x3F : 0x0F;
+                            print(local_nodes[i]->is_folder ? " [DIR]  " : " [FILE] ");
+                            print(get_filename_only(local_nodes[i]->name));
+                            for (int p = col; p < 79; p++) putchar(' ');
+                            putchar('\n');
+                            current_render_idx++;
+                        }
+                    } 
+                    // RENDER NATIVE FAT16 ACTIVE DIRECTORY CACHE
+                    else {
+                        for (int i = 0; i < total_files; i++) {
+                            color = (selected_file_index == current_render_idx) ? 0x3F : 0x0F;
+                            print(fat_dir_cache[i].is_folder ? " [DIR]  " : " [FILE] ");
+                            print(fat_dir_cache[i].name);
+                            for (int p = col; p < 79; p++) putchar(' ');
+                            putchar('\n');
+                            current_render_idx++;
+                        }
+                    }
+
+                    if (total_files == 0 && !has_back_link) {
+                        print(" (Directory is completely empty)\n");
+                    }
                 }
 
-                // Render folders and files
-                for (int i = 0; i < total_files; i++) {
-                    color = (selected_file_index == current_render_idx) ? 0x3F : 0x0F;
-                    print(local_nodes[i]->is_folder ? " [DIR]  " : " [FILE] ");
-                    print(local_nodes[i]->name);
-
-                    int name_len = 0; while(local_nodes[i]->name[name_len]) name_len++;
-                    int written = 8 + name_len;
-                    for (int p = written; p < 79; p++) putchar(' ');
-                    
-                    putchar('\n');
-                    current_render_idx++;
-                }
-
-                color = 0x0F; // Reset to standard layout white
-                if (rendering_bound == 0) {
-                    print(" (Directory is empty)\n");
-                }
-                
-                force_redraw = false; // Refresh state handled
+                color = 0x0F; // Reset color palette
+                force_redraw = false; 
             }
 
-            // Pull non-blocking keyboard frame input
+            // Keyboard/Mouse Input Ingestion Handler
             char c = keyboard_getchar(); 
             bool trigger_action = false;
 
-            // Interactive Workspace Mouse Hit-Testing
-            int base_list_row = 5; // Headers consume rows up to Line 5
+            int base_list_row = 11; 
             if ((mouse_byte[0] & 0x01) && mouse_y >= base_list_row && mouse_y < (base_list_row + rendering_bound)) {
                 int resolved_idx = mouse_y - base_list_row;
                 if (resolved_idx >= 0 && resolved_idx < rendering_bound) {
                     if (selected_file_index != resolved_idx) {
                         selected_file_index = resolved_idx;
-                        force_redraw = true; // Instantly move the cyan block under the click
+                        force_redraw = true; 
                     }
                     trigger_action = true;
                 }
             }
 
-            // Input Event Dispatcher
-            if (c == 27) { // ESC -> Exit app
-                in_file_manager = false;
-                break;
+            if (c == 27) { // ESC -> Up one level
+                if (!in_root_view) {
+                    if (current_drive_id == 1 && current_dir_ptr == all_nodes_head) {
+                        in_root_view = true;
+                        selected_file_index = 0;
+                    } else if (current_drive_id == 1) {
+                        current_dir_ptr = current_dir_ptr->parent;
+                    } else {
+                        if (fat_current_cluster == 0) {
+                            in_root_view = true;
+                            selected_file_index = current_drive_id - 1;
+                        } else {
+                            fat_current_cluster = 0; // Return to FAT root sector
+                            fat_current_path[0] = '\0';
+                        }
+                    }
+                    force_redraw = true;
+                } else {
+                    in_file_manager = false;
+                    break;
+                }
             }
-            if (c == '\t') { // TAB -> Cycle items
+            if (c == '\t') { // TAB -> Cycle Down List
                 if (rendering_bound > 0) {
                     selected_file_index = (selected_file_index + 1) % rendering_bound;
                     force_redraw = true;
                 }
             }
-            if (c == '\n' || trigger_action) { // Action committed
-                if (has_back_link && selected_file_index == 0) {
-                    current_dir_ptr = current_dir_ptr->parent;
-                    selected_file_index = 0;
+            if (c == '\n' || trigger_action) {
+                if (in_root_view) {
+                    int selected_drive = selected_file_index + 1;
+                    if (selected_drive == 1) {
+                        current_drive_id = 1;
+                        in_root_view = false;
+                        selected_file_index = 0;
+                    } else {
+                        if (!system_drives[selected_drive - 1].is_mounted) {
+                            print("\nProbing hardware device parameters... ");
+                            int old_drive = current_drive_id;
+                            current_drive_id = selected_drive;
+                            if (FAT::mount_drive()) {
+                                system_drives[selected_drive - 1].is_mounted = true;
+                                fat_current_path[0] = '\0';
+                                fat_current_cluster = 0;
+                                in_root_view = false;
+                                selected_file_index = 0;
+                            } else {
+                                print("Hardware Error: Unable to verify boot sectors.\n");
+                                current_drive_id = old_drive;
+                                for(volatile uint64_t d = 0; d < 30000000; d++);
+                            }
+                        } else {
+                            current_drive_id = selected_drive;
+                            fat_current_path[0] = '\0';
+                            fat_current_cluster = 0;
+                            in_root_view = false;
+                            selected_file_index = 0;
+                        }
+                    }
                     force_redraw = true;
-                } else {
-                    int target_array_idx = has_back_link ? (selected_file_index - 1) : selected_file_index;
-                    Node* target_node = local_nodes[target_array_idx];
-
-                    if (target_node->is_folder) {
-                        current_dir_ptr = target_node;
+                } 
+                else {
+                    if (has_back_link && selected_file_index == 0) {
+                        // GO BACK ENGINE
+                        if (current_drive_id == 1) {
+                            if (current_dir_ptr == all_nodes_head) in_root_view = true;
+                            else current_dir_ptr = current_dir_ptr->parent;
+                        } else {
+                            if (fat_current_cluster == 0) in_root_view = true;
+                            else { fat_current_cluster = 0; fat_current_path[0] = '\0'; }
+                        }
                         selected_file_index = 0;
                         force_redraw = true;
-                    } else {
-                        enable_cursor(1, 15); // Restore hardware cursor for Notepad typing
-                        notepad(target_node);
-                        outb(0x3D4, 0x0A); outb(0x3D5, 0x20); // Re-hide cursor on menu return
-                        force_redraw = true;
+                    } 
+                    else {
+                        int target_idx = has_back_link ? (selected_file_index - 1) : selected_file_index;
+
+                        if (current_drive_id == 1) {
+                            Node* target_node = local_nodes[target_idx];
+                            if (target_node->is_folder) {
+                                current_dir_ptr = target_node;
+                                selected_file_index = 0;
+                            } else {
+                                enable_cursor(1, 15);
+                                clear_workspace();
+                                if (ends_with_bf(target_node->name)) {
+                                    run_bf(target_node);
+                                    print("\nPress any key to return...");
+                                    keyboard_getchar();
+                                } else {
+                                    write_app_start(target_node->name);
+                                }
+                                outb(0x3D4, 0x0A); outb(0x3D5, 0x20);
+                            }
+                            force_redraw = true;
+                        } 
+                        else {
+                            // -------------------------------------------------
+                            // NATIVE HARDWARE FAT16 EXECUTION MATRIX
+                            // -------------------------------------------------
+                            FATCacheEntry target_fat = fat_dir_cache[target_idx];
+                            
+                            if (target_fat.is_folder) {
+                                // 1. Synchronously shift target cluster pointer
+                                fat_current_cluster = target_fat.cluster;
+                                
+                                // 2. Safely append folder string name tokens
+                                int p_idx = 0; 
+                                while (fat_current_path[p_idx]) p_idx++;
+
+                                if (p_idx < 120) {
+                                    if (p_idx > 0 && fat_current_path[p_idx - 1] != '/') {
+                                        fat_current_path[p_idx++] = '/';
+                                    }
+                                    for (int m = 0; target_fat.name[m] && p_idx < 240; m++) {
+                                        fat_current_path[p_idx++] = target_fat.name[m];
+                                    }
+                                    fat_current_path[p_idx] = '\0';
+                                }
+
+                                // 3. FORCE SYNCHRONOUS INVALDIATION AND IMMEDIATE FLUSH RE-READ
+                                fat_cache_count = 0;
+                                selected_file_index = 0;
+                                FAT::list_directory_to_cache(fat_current_cluster, fat_ui_cache_callback);
+                                
+                                // Apply the validation filter again instantly inside the trigger execution block
+                                int inner_valid = 0;
+                                for (int i = 0; i < fat_cache_count; i++) {
+                                    if (fat_dir_cache[i].name[0] == '.') continue;
+                                    if (inner_valid != i) fat_dir_cache[inner_valid] = fat_dir_cache[i];
+                                    inner_valid++;
+                                }
+                                fat_cache_count = inner_valid;
+                                total_files = fat_cache_count;
+                            } 
+                            else {
+                                // RUN / VIEW INDIVIDUAL FILES FROM RAW HARDWARE CLUSTERS
+                                enable_cursor(1, 15);
+                                clear_workspace();
+                                
+                                char bf_workspace_buf[1024];
+                                for (int i = 0; i < 1024; i++) bf_workspace_buf[i] = 0;
+
+                                int bytes_read = FAT::read_file_data(target_fat.name, fat_current_cluster, (uint8_t*)bf_workspace_buf);
+                                
+                                // FIX: Check if the file is just newly created/empty (0 bytes)
+                                if (target_fat.size == 0 || bytes_read == 0) {
+                                    print("--- Notepad ---\n");
+                                    print("File is empty. Opening blank workspace...\n");
+                                    for(volatile uint64_t d = 0; d < 15000000; d++);
+                                    write_app_start(target_fat.name);
+                                }
+                                else if (bytes_read > 0) {
+                                    if (bytes_read >= 1024) bytes_read = 1023;
+                                    bf_workspace_buf[bytes_read] = '\0';
+
+                                    if (ends_with_bf(target_fat.name)) {
+                                        Node temporary_node;
+                                        temporary_node.is_folder = false;
+                                        temporary_node.size = bytes_read;
+                                        for (int i = 0; i <= bytes_read; i++) temporary_node.content[i] = bf_workspace_buf[i];
+
+                                        run_bf(&temporary_node);
+                                        print("\n\nExecution terminated. Press any key...");
+                                        keyboard_getchar();
+                                    } 
+                                    else {
+                                        write_app_start(target_fat.name);
+                                    }
+                                } else {
+                                    print("Hardware sector compilation reading anomaly.\n");
+                                    print("Error Code: "); print_int(bytes_read); print("\n");
+                                    for(volatile uint64_t d = 0; d < 30000000; d++);
+                                }
+                                outb(0x3D4, 0x0A); outb(0x3D5, 0x20);
+                            }
+                            force_redraw = true;
+                        }
                     }
                 }
                 
-                // CRITICAL DEBOUNCE DRAIN: Wait right here inside the file manager loop 
-                // until the user completely lifts their finger off the left mouse button
-                while (mouse_byte[0] & 0x01) {
-                    asm volatile("nop");
-                }
+                while (mouse_byte[0] & 0x01) { asm volatile("nop"); }
                 for(volatile uint64_t d = 0; d < 20000000; d++);
             }
-
-            asm volatile("nop"); // Keep CPU running cleanly without locking the thread
+            asm volatile("nop"); 
         }
 
-        // Restore normal terminal state when completely exiting the File Manager
         enable_cursor(1, 15);
         current_mode = MODE_MENU_NAV;
         clear_workspace();
@@ -443,12 +1132,8 @@ void execute_tui_app() {
     // =========================================================================
     else if (active_selection == 2) {
         print("Enter workspace target file name: \n> ");
-        
-        // Initialize structural boundaries so kernel_main can track typing offsets
         prompt_start_col = col; 
         input_length = 0;
-        
-        // Ensure the hardware blinker is active and tracking the position
         enable_cursor(1, 15);
         update_cursor();
     }
@@ -458,7 +1143,7 @@ void execute_tui_app() {
     // =========================================================================
     else if (active_selection == 3) {
         clear_workspace();
-        color = 0x0E; // Yellow status warning
+        color = 0x0E; 
         print("Rebooting system components...\n");
         for(uint64_t i = 0; i < 400000000; i++) { asm volatile("nop"); }
         hard_reboot();
@@ -469,16 +1154,15 @@ void execute_tui_app() {
     // =========================================================================
     else if (active_selection == 4) {
         clear_workspace();
-        color = 0x0C; // Crimson Red shutdown status
+        color = 0x0C; 
         print("Shutting down kernel processing subsystems...\n");
         for(uint64_t i = 0; i < 600000000; i++) { asm volatile("nop"); }
         
-        // Trigger ACPI & QEMU/Bochs IO emulator poweroff sequences
         outw(0xB004, 0x2000); 
         outw(0x604, 0x2000); 
         outw(0x4004, 0x3400); 
         
-        color = 0x1F; // High visibility Blue Screen warning layout
+        color = 0x1F; 
         print("\nIt is now safe to turn off your computer."); 
         while(1) { asm volatile("hlt"); }
     }
@@ -552,11 +1236,24 @@ extern "C" void kernel_main() {
     pic_remap(); 
     heap_init(); 
     pic_clear_mask(1); 
+    fs_init(); 
+    if (Disk::init()) {
+        print("ATA Disk Controller initialized successfully.\n");
+        
+        // 2. Mount NyxFS (this will auto-format if the disk is fresh!)
+        print("Mounting NyxFS... ");
+        if (NyxFS::mount()) {
+            print("[ SUCCESS ]\n");
+        } else {
+            print("[ FAILED ]\n");
+        }
+    } else {
+        print("CRITICAL: Failed to initialize ATA Disk Controller.\n");
+    }
     
     mouse_init();
     asm volatile ("sti"); 
     
-    fs_init(); 
     enable_cursor(14,15); 
     splash_screen(); 
     
@@ -632,7 +1329,7 @@ extern "C" void kernel_main() {
                     if (!target) target = fs_create(input_buffer, false);
                     
                     // Boot into notepad text editing mode
-                    notepad(target);
+                    write_app_start(target->name);
                     
                     // When notepad closes, smoothly snap back to main menu
                     current_mode = MODE_MENU_NAV;
